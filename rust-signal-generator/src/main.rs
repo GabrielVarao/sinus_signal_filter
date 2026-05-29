@@ -1,22 +1,21 @@
-use chrono::Local;
+use prost::Message;
 use rand::Rng;
-use serde::Serialize;
 use std::collections::VecDeque;
 use std::error::Error;
+use std::time::Duration;
+use zeromq::{PubSocket, Socket, SocketSend};
 
-const SAMPLE_COUNT: usize = 300;
+// This module is generated automatically from proto/signal.proto.
+pub mod signal {
+    include!(concat!(env!("OUT_DIR"), "/signal.rs"));
+}
+
+const SAMPLE_COUNT: usize = 600;
 const MIN_VALUE: f64 = 0.0;
 const MAX_VALUE: f64 = 100.0;
 const NOISE_PERCENT: f64 = 0.05;
 const FILTER_WINDOW: usize = 7;
-
-#[derive(Serialize)]
-struct SignalSample {
-    time: usize,
-    clean: f64,
-    noisy: f64,
-    filtered: f64,
-}
+const ZMQ_ADDRESS: &str = "tcp://127.0.0.1:5555";
 
 struct SignalProfile {
     start_value: f64,
@@ -30,14 +29,22 @@ struct SignalProfile {
     fall_until: usize,
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     println!("Rust Signal Filter Lab");
-    println!("Generating random signal data...");
+    println!("Starting ZMQ publisher on {}", ZMQ_ADDRESS);
+    println!("Sending protobuf encoded signal samples...");
+
+    // Create a ZeroMQ PUB socket.
+    let mut publisher = PubSocket::new();
+    publisher.bind(ZMQ_ADDRESS).await?;
+
+    // Give the Python subscriber a short moment to connect.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
 
     let mut rng = rand::thread_rng();
-    let mut filter_buffer: VecDeque<f64> = VecDeque::new();
-
     let profile = generate_random_profile(&mut rng);
+    let mut filter_buffer: VecDeque<f64> = VecDeque::new();
 
     println!("Random signal profile:");
     println!("Start value: {:.1}", profile.start_value);
@@ -45,37 +52,45 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Peak value:  {:.1}", profile.peak_value);
     println!("End value:   {:.1}", profile.end_value);
 
-    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-    let output_path = format!("../data/signal_data_{}.csv", timestamp);
-
-    let mut writer = csv::Writer::from_path(&output_path)?;
-
     for time in 0..SAMPLE_COUNT {
+        // Generate clean signal value.
         let clean = generate_clean_signal(time, &profile);
+
+        // Add random noise.
         let noise = generate_noise(&mut rng);
         let noisy = clamp(clean + noise, MIN_VALUE, MAX_VALUE);
+
+        // Filter noisy signal.
         let filtered = moving_average_filter(&mut filter_buffer, noisy);
 
-        let sample = SignalSample {
-            time,
+        // Create protobuf message.
+        let sample = signal::SignalSample {
+            time: time as u32,
             clean,
             noisy,
             filtered,
         };
 
-        writer.serialize(sample)?;
+        // Encode protobuf message into binary data.
+        let mut buffer = Vec::new();
+        sample.encode(&mut buffer)?;
+
+        // Send binary protobuf data over ZeroMQ.
+        publisher.send(buffer.into()).await?;
+
+        println!(
+            "Sent sample {:>3}: clean={:>6.2}, noisy={:>6.2}, filtered={:>6.2}",
+            time, clean, noisy, filtered
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    writer.flush()?;
-
-    println!("Done!");
-    println!("CSV saved to: {}", output_path);
-
+    println!("Finished sending live signal data.");
     Ok(())
 }
 
-// Erstellt für jeden Programmstart ein neues zufälliges Signalprofil.
-// Dadurch sieht jede CSV-Datei wirklich anders aus.
+// Creates a random signal profile for each program run.
 fn generate_random_profile(rng: &mut rand::rngs::ThreadRng) -> SignalProfile {
     let start_value = rng.gen_range(20.0..40.0);
     let ramp_target = rng.gen_range(50.0..70.0);
@@ -101,8 +116,7 @@ fn generate_random_profile(rng: &mut rand::rngs::ThreadRng) -> SignalProfile {
     }
 }
 
-// Erzeugt ein künstliches Messsignal anhand eines zufälligen Profils.
-// Das Signal ist jetzt bei jedem Programmstart anders.
+// Generates a clean artificial sensor signal.
 fn generate_clean_signal(time: usize, profile: &SignalProfile) -> f64 {
     if time < profile.stable_until {
         profile.start_value
@@ -131,8 +145,7 @@ fn generate_clean_signal(time: usize, profile: &SignalProfile) -> f64 {
     }
 }
 
-// Lineare Interpolation.
-// Damit kann das Signal sauber von einem Wert zu einem anderen Wert steigen/fallen.
+// Linear interpolation between two values.
 fn interpolate(
     time: usize,
     start_time: usize,
@@ -144,16 +157,14 @@ fn interpolate(
     start_value + progress * (end_value - start_value)
 }
 
-// Erzeugt zufälliges Rauschen von ungefähr ±5%.
-// Bei Messbereich 0 bis 100 bedeutet 5% ungefähr ±5.
+// Generates random noise of approximately +/- 5% of the measurement range.
 fn generate_noise(rng: &mut rand::rngs::ThreadRng) -> f64 {
     let noise_range = (MAX_VALUE - MIN_VALUE) * NOISE_PERCENT;
     rng.gen_range(-noise_range..=noise_range)
 }
 
-// Moving-Average-Filter.
-// Er nimmt die letzten Werte und bildet daraus den Durchschnitt.
-// Dadurch wird das verrauschte Signal geglättet.
+// Moving average filter.
+// It averages the latest values to smooth the noisy signal.
 fn moving_average_filter(buffer: &mut VecDeque<f64>, new_value: f64) -> f64 {
     buffer.push_back(new_value);
 
@@ -165,7 +176,7 @@ fn moving_average_filter(buffer: &mut VecDeque<f64>, new_value: f64) -> f64 {
     sum / buffer.len() as f64
 }
 
-// Begrenzt Werte auf den erlaubten Messbereich.
+// Limits values to the valid measurement range.
 fn clamp(value: f64, min: f64, max: f64) -> f64 {
     if value < min {
         min

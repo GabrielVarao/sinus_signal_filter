@@ -1,2 +1,4 @@
-pandas
 matplotlib
+pyzmq
+protobuf
+grpcio-tools
