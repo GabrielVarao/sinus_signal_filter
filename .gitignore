@@ -1,0 +1,21 @@
+# Rust build output
+target/
+
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# Generated data files
+data/*.csv
+
+# Optional generated plot images
+*.png
+
+# Editor files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
